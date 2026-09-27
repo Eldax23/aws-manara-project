@@ -1,0 +1,136 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Root Orchestration Stack: Serverless Image Processing Pipeline'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: ServerlessImagePipeline
+    Description: Project resource identifier
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for pipeline operational notifications and alerts
+
+  TemplateBucket:
+    Type: String
+    Description: S3 bucket name containing uploaded CloudFormation nested templates
+
+Resources:
+  # ─── Stack 1: Storage & Queues Foundation ───────────────────────────────────
+  StorageAndQueuesStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/01-storage-queues.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+
+  # ─── Stack 2: Database & Notifications ──────────────────────────────────────
+  DatabaseAndNotificationsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/02-database-notifications.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        ProjectName: !Ref ProjectName
+        NotificationEmail: !Ref NotificationEmail
+
+  # ─── Stack 3: IAM Least-Privilege Roles ──────────────────────────────────────
+  IAMRolesStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/03-iam-roles.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        SourceBucketArn: !GetAtt StorageAndQueuesStack.Outputs.SourceBucketArn
+        DestinationBucketArn: !GetAtt StorageAndQueuesStack.Outputs.DestinationBucketArn
+        QueueArn: !GetAtt StorageAndQueuesStack.Outputs.ImageProcessingQueueArn
+        DynamoDBTableArn: !GetAtt DatabaseAndNotificationsStack.Outputs.DynamoDBTableArn
+        SNSTopicArn: !GetAtt DatabaseAndNotificationsStack.Outputs.SNSTopicArn
+
+  # ─── Stack 4: Lambda Functions & Event Source Mapping ────────────────────────
+  LambdaFunctionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/05-lambda-functions.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        SourceBucketName: !GetAtt StorageAndQueuesStack.Outputs.SourceBucketName
+        DestinationBucketName: !GetAtt StorageAndQueuesStack.Outputs.DestinationBucketName
+        DynamoDBTableName: !GetAtt DatabaseAndNotificationsStack.Outputs.DynamoDBTableName
+        QueueArn: !GetAtt StorageAndQueuesStack.Outputs.ImageProcessingQueueArn
+        SNSTopicArn: !GetAtt DatabaseAndNotificationsStack.Outputs.SNSTopicArn
+        PresignedUrlGeneratorRoleArn: !GetAtt IAMRolesStack.Outputs.PresignedUrlGeneratorRoleArn
+        SQSConsumerRoleArn: !GetAtt IAMRolesStack.Outputs.SQSConsumerRoleArn
+        ImageProcessorRoleArn: !GetAtt IAMRolesStack.Outputs.ImageProcessorRoleArn
+        NotificationDispatcherRoleArn: !GetAtt IAMRolesStack.Outputs.NotificationDispatcherRoleArn
+        StateMachineArn: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${Environment}-ImageProcessingWorkflow'
+
+  # ─── Stack 5: Step Functions Orchestration ───────────────────────────────────
+  StepFunctionsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/04-step-functions.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        StepFunctionsExecutionRoleArn: !GetAtt IAMRolesStack.Outputs.StepFunctionsExecutionRoleArn
+        ImageProcessorFunctionArn: !GetAtt LambdaFunctionsStack.Outputs.ImageProcessorFunctionArn
+        NotificationDispatcherFunctionArn: !GetAtt LambdaFunctionsStack.Outputs.NotificationDispatcherFunctionArn
+
+  # ─── Stack 6: API Gateway Ingestion Endpoint ─────────────────────────────────
+  ApiGatewayStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/06-api-gateway.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        PresignedUrlGeneratorFunctionArn: !GetAtt LambdaFunctionsStack.Outputs.PresignedUrlGeneratorFunctionArn
+
+  # ─── Stack 7: CloudFront Edge CDN with OAC ───────────────────────────────────
+  CloudFrontStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/07-cloudfront.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        DestinationBucketName: !GetAtt StorageAndQueuesStack.Outputs.DestinationBucketName
+        DestinationBucketArn: !GetAtt StorageAndQueuesStack.Outputs.DestinationBucketArn
+
+  # ─── Stack 8: CloudWatch Alarms & Operational Dashboard ──────────────────────
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub 'https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/cloudformation/08-monitoring.yaml'
+      Parameters:
+        Environment: !Ref Environment
+        DLQName: !Sub '${Environment}-image-processing-dlq'
+        SNSTopicArn: !GetAtt DatabaseAndNotificationsStack.Outputs.SNSTopicArn
+        ImageProcessorFunctionName: !Sub '${Environment}-ImageProcessor'
+        StateMachineArn: !GetAtt StepFunctionsStack.Outputs.StateMachineArn
+
+Outputs:
+  ApiEndpointUrl:
+    Value: !GetAtt ApiGatewayStack.Outputs.ApiEndpointUrl
+    Description: Public API Gateway endpoint for requesting presigned upload URLs
+
+  CloudFrontDomain:
+    Value: !GetAtt CloudFrontStack.Outputs.CloudFrontDomainName
+    Description: CloudFront CDN distribution domain name for fast global image access
+
+  SourceBucket:
+    Value: !GetAtt StorageAndQueuesStack.Outputs.SourceBucketName
+    Description: S3 Source Bucket name
+
+  DestinationBucket:
+    Value: !GetAtt StorageAndQueuesStack.Outputs.DestinationBucketName
+    Description: S3 Destination Bucket name
+
+  DynamoDBTable:
+    Value: !GetAtt DatabaseAndNotificationsStack.Outputs.DynamoDBTableName
+    Description: DynamoDB Table name

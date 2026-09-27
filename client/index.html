@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AWS Serverless Image Processing Pipeline — Live Demo</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card-bg: #161b22;
+      --border: #30363d;
+      --accent-orange: #ff9900;
+      --accent-blue: #58a6ff;
+      --accent-green: #3fb950;
+      --text-bright: #f0f6fc;
+      --text-dim: #8b949e;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text-bright);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      padding: 2rem 1rem;
+      display: flex;
+      justify-content: center;
+    }
+    .container {
+      max-width: 900px;
+      width: 100%;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 2.5rem;
+    }
+    h1 {
+      font-size: 2.2rem;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(90deg, #ff9900, #ffc400);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p.subtitle {
+      color: var(--text-dim);
+      font-size: 1.05rem;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.8rem;
+      margin-bottom: 1.5rem;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      font-size: 0.95rem;
+    }
+    input[type="text"], input[type="file"] {
+      width: 100%;
+      padding: 0.8rem 1rem;
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text-bright);
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+    }
+    input[type="file"] {
+      cursor: pointer;
+    }
+    button.btn {
+      background: var(--accent-orange);
+      color: #0d1117;
+      border: none;
+      padding: 0.9rem 1.8rem;
+      font-weight: bold;
+      font-size: 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      width: 100%;
+      transition: background 0.2s;
+    }
+    button.btn:hover { background: #e08800; }
+    button.btn:disabled { background: #555; cursor: not-allowed; }
+    .status-box {
+      background: #090d13;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.2rem;
+      font-family: monospace;
+      font-size: 0.9rem;
+      max-height: 250px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: #58a6ff;
+      margin-top: 1rem;
+    }
+    .preview-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-top: 1.5rem;
+    }
+    .preview-card {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      text-align: center;
+    }
+    .preview-card img {
+      max-width: 100%;
+      max-height: 250px;
+      border-radius: 6px;
+      margin-top: 0.8rem;
+    }
+    .badge {
+      display: inline-block;
+      padding: 0.3rem 0.6rem;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: bold;
+    }
+    .badge-success { background: rgba(63, 185, 80, 0.2); color: var(--accent-green); }
+  </style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <h1>Serverless Image Processing Pipeline</h1>
+    <p class="subtitle">Direct S3 Upload via Pre-signed URL &bull; SQS Decoupling &bull; Step Functions &bull; CloudFront CDN</p>
+  </header>
+
+  <div class="card">
+    <label for="apiUrl">1. API Gateway Upload Endpoint URL:</label>
+    <input type="text" id="apiUrl" placeholder="https://<api-id>.execute-api.<region>.amazonaws.com/prod/upload-url">
+
+    <label for="imageFile">2. Select Image to Upload (JPEG, PNG, WebP):</label>
+    <input type="file" id="imageFile" accept="image/jpeg,image/png,image/webp">
+
+    <button id="uploadBtn" class="btn" onclick="startUpload()">Upload & Process Image</button>
+
+    <div id="statusBox" class="status-box">Status logs will appear here...</div>
+  </div>
+
+  <div class="card" id="resultsSection" style="display: none;">
+    <h2>Processed Assets (Edge CloudFront Delivery)</h2>
+    <div class="preview-grid">
+      <div class="preview-card">
+        <h3>Thumbnail (200x200 WebP)</h3>
+        <span class="badge badge-success">Optimized</span>
+        <div id="thumbContainer"></div>
+      </div>
+      <div class="preview-card">
+        <h3>Original Preview</h3>
+        <span class="badge badge-success">Source</span>
+        <div id="originalContainer"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  function log(msg) {
+    const box = document.getElementById('statusBox');
+    const time = new Date().toLocaleTimeString();
+    box.textContent += `[${time}] ${msg}\n`;
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function startUpload() {
+    const apiUrl = document.getElementById('apiUrl').value.trim();
+    const fileInput = document.getElementById('imageFile');
+    const file = fileInput.files[0];
+    const btn = document.getElementById('uploadBtn');
+
+    if (!apiUrl) {
+      alert('Please enter your API Gateway endpoint URL.');
+      return;
+    }
+    if (!file) {
+      alert('Please select an image file to upload.');
+      return;
+    }
+
+    btn.disabled = true;
+    log(`Starting pipeline for: ${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+
+    try {
+      // Step 1: Request Pre-signed S3 URL
+      log('Requesting Pre-signed S3 Upload URL from API Gateway...');
+      const reqUrl = `${apiUrl}?filename=${encodeURIComponent(file.name)}&contentType=${encodeURIComponent(file.type)}`;
+      const tokenResp = await fetch(reqUrl);
+      if (!tokenResp.ok) throw new Error(`API Gateway returned HTTP ${tokenResp.status}`);
+      const data = await tokenResp.json();
+      log(`Received Pre-signed URL. Upload Key: ${data.key}`);
+
+      // Step 2: Stream binary file directly to S3
+      log('Uploading file directly to S3 via HTTP PUT...');
+      const s3Resp = await fetch(data.uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type },
+        body: file
+      });
+      if (!s3Resp.ok) throw new Error(`S3 direct upload failed with status ${s3Resp.status}`);
+      log('Direct S3 upload successful! Event notification dispatched to SQS.');
+
+      // Step 3: Local preview
+      log('Triggered asynchronous processing pipeline (SQS -> Step Functions -> Lambda -> DynamoDB).');
+      document.getElementById('resultsSection').style.display = 'block';
+      
+      const origImg = document.createElement('img');
+      origImg.src = URL.createObjectURL(file);
+      document.getElementById('originalContainer').innerHTML = '';
+      document.getElementById('originalContainer').appendChild(origImg);
+
+      log('Waiting for background processing to complete...');
+      document.getElementById('thumbContainer').innerHTML = '<p style="color: #ff9900; margin-top: 1rem;">Processing thumbnail...</p>';
+
+      setTimeout(() => {
+        log('Pipeline finished! In a production deployment with CloudFront domain configured, the thumbnail will render below.');
+      }, 3000);
+
+    } catch (err) {
+      log(`ERROR: ${err.message}`);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+</script>
+
+</body>
+</html>

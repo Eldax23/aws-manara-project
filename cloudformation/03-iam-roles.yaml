@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 03: Least-Privilege IAM Roles and Policies'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  SourceBucketArn:
+    Type: String
+    Description: ARN of S3 Source Bucket
+
+  DestinationBucketArn:
+    Type: String
+    Description: ARN of S3 Destination Bucket
+
+  QueueArn:
+    Type: String
+    Description: ARN of SQS Main Queue
+
+  DynamoDBTableArn:
+    Type: String
+    Description: ARN of DynamoDB ImageMetadata Table
+
+  SNSTopicArn:
+    Type: String
+    Description: ARN of SNS Alerts Topic
+
+Resources:
+  # ─── 1. Presigned URL Generator Lambda Role ──────────────────────────────────
+  PresignedUrlGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-PresignedUrlGeneratorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutPermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${SourceBucketArn}/*'
+
+  # ─── 2. SQS Consumer Lambda Role ─────────────────────────────────────────────
+  SQSConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-SQSConsumerRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSPollingAndStepFunctionsStart
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !Ref QueueArn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${Environment}-ImageProcessingWorkflow'
+
+  # ─── 3. Image Processor Lambda Role ──────────────────────────────────────────
+  ImageProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-ImageProcessorRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ImageProcessingPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${SourceBucketArn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${DestinationBucketArn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !Ref DynamoDBTableArn
+                  - !Sub '${DynamoDBTableArn}/index/*'
+
+  # ─── 4. Notification Dispatcher Lambda Role ──────────────────────────────────
+  NotificationDispatcherRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-NotificationDispatcherRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPermission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+
+  # ─── 5. Step Functions State Machine Execution Role ──────────────────────────
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-StepFunctionsExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokePipelineLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Environment}-ImageProcessor'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Environment}-NotificationDispatcher'
+
+Outputs:
+  PresignedUrlGeneratorRoleArn:
+    Value: !GetAtt PresignedUrlGeneratorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PresignedUrlGeneratorRoleArn'
+
+  SQSConsumerRoleArn:
+    Value: !GetAtt SQSConsumerRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSConsumerRoleArn'
+
+  ImageProcessorRoleArn:
+    Value: !GetAtt ImageProcessorRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageProcessorRoleArn'
+
+  NotificationDispatcherRoleArn:
+    Value: !GetAtt NotificationDispatcherRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationDispatcherRoleArn'
+
+  StepFunctionsExecutionRoleArn:
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionsExecutionRoleArn'

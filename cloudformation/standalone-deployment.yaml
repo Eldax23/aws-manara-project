@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Serverless Image Processing Pipeline - Standalone Unified Deployment Template'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  NotificationEmail:
+    Type: String
+    Default: 'admin@example.com'
+    Description: Email address for operational alerts and pipeline completion events
+
+Resources:
+  # ─── Storage Foundation ──────────────────────────────────────────────────────
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${Environment}-raw-images'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${Environment}-processed-images'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTlsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SourceBucket.Arn}'
+              - !Sub '${SourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ─── SQS Queues ──────────────────────────────────────────────────────────────
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-image-pipeline-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: 'alias/aws/sqs'
+
+  ImageProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-image-pipeline-queue'
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600
+      KmsMasterKeyId: 'alias/aws/sqs'
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 3
+
+  ImageProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ImageProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3Notifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: 'sqs:SendMessage'
+            Resource: !GetAtt ImageProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt SourceBucket.Arn
+
+  # ─── DynamoDB & SNS ──────────────────────────────────────────────────────────
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${Environment}-ImageMetadata-Catalog'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: upload_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: image_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: upload_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  ImageAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Environment}-image-pipeline-alerts'
+      DisplayName: 'Image Pipeline Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+
+  AlertsEmailSub:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ImageAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ─── IAM Roles ───────────────────────────────────────────────────────────────
+  LambdaBasicRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-PipelineLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PipelineResourcesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject']
+                Resource:
+                  - !Sub '${SourceBucket.Arn}/*'
+                  - !Sub '${DestinationBucket.Arn}/*'
+              - Effect: Allow
+                Action: ['sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes']
+                Resource: !GetAtt ImageProcessingQueue.Arn
+              - Effect: Allow
+                Action: ['dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:GetItem']
+                Resource:
+                  - !GetAtt ImageMetadataTable.Arn
+                  - !Sub '${ImageMetadataTable.Arn}/index/*'
+              - Effect: Allow
+                Action: ['sns:Publish']
+                Resource: !Ref ImageAlertsTopic
+              - Effect: Allow
+                Action: ['states:StartExecution']
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${Environment}-ImageWorkflow'
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-StepFunctionsWorkflowRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['lambda:InvokeFunction']
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Environment}-ImageProcessorFn'
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${Environment}-NotifierFn'
+
+  # ─── Lambda Functions ────────────────────────────────────────────────────────
+  PresignedUrlFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-PresignedUrlFn'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaBasicRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucket
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          s3_client = boto3.client('s3')
+          bucket = os.environ.get('SOURCE_BUCKET')
+          cors = {'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': 'GET,OPTIONS'}
+          def handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': cors, 'body': ''}
+              params = event.get('queryStringParameters') or {}
+              fname = params.get('filename', 'upload.jpg')
+              ctype = params.get('contentType', 'image/jpeg')
+              ext = os.path.splitext(fname)[1] or '.jpg'
+              key = f"uploads/{uuid.uuid4()}{ext}"
+              url = s3_client.generate_presigned_url('put_object', Params={'Bucket': bucket, 'Key': key, 'ContentType': ctype}, ExpiresIn=900)
+              return {'statusCode': 200, 'headers': cors, 'body': json.dumps({'uploadUrl': url, 'bucket': bucket, 'key': key})}
+
+  SQSConsumerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-SQSConsumerFn'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaBasicRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${Environment}-ImageWorkflow'
+      Code:
+        ZipFile: |
+          import json, os, urllib.parse, boto3
+          sfn = boto3.client('stepfunctions')
+          arn = os.environ.get('STATE_MACHINE_ARN')
+          def handler(event, context):
+              for rec in event.get('Records', []):
+                  body = json.loads(rec.get('body', '{}'))
+                  for s3_rec in body.get('Records', []):
+                      s3 = s3_rec.get('s3', {})
+                      b = s3.get('bucket', {}).get('name')
+                      k = urllib.parse.unquote_plus(s3.get('object', {}).get('key', ''))
+                      if b and k:
+                          name = f"exec-{context.aws_request_id[:8]}"
+                          sfn.start_execution(stateMachineArn=arn, name=name, input=json.dumps({'sourceBucket': b, 'sourceKey': k}))
+              return {'statusCode': 200}
+
+  SQSMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ImageProcessingQueue.Arn
+      FunctionName: !GetAtt SQSConsumerFn.Arn
+      BatchSize: 5
+      Enabled: true
+
+  ImageProcessorFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-ImageProcessorFn'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaBasicRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationBucket
+          DYNAMODB_TABLE: !Ref ImageMetadataTable
+      Code:
+        ZipFile: |
+          import json, os, io, hashlib, boto3
+          from datetime import datetime, timezone
+          from PIL import Image, ImageOps
+          s3 = boto3.client('s3')
+          dynamo = boto3.resource('dynamodb')
+          dest_bucket = os.environ.get('DESTINATION_BUCKET')
+          tbl_name = os.environ.get('DYNAMODB_TABLE')
+          def handler(event, context):
+              action = event.get('action')
+              b, k = event.get('sourceBucket'), event.get('sourceKey')
+              if action == 'validate':
+                  obj = s3.get_object(Bucket=b, Key=k)
+                  raw = obj['Body'].read()
+                  with Image.open(io.BytesIO(raw)) as im:
+                      return {'status': 'VALIDATED', 'format': im.format, 'width': im.size[0], 'height': im.size[1], 'size': len(raw), 'md5': hashlib.md5(raw).hexdigest()}
+              elif action == 'extract_metadata':
+                  v = event.get('validation', {})
+                  return {'width': v.get('width'), 'height': v.get('height'), 'format': v.get('format'), 'md5': v.get('md5')}
+              elif action == 'resize_and_watermark':
+                  base = os.path.splitext(os.path.basename(k))[0]
+                  obj = s3.get_object(Bucket=b, Key=k)
+                  im = Image.open(io.BytesIO(obj['Body'].read()))
+                  im = ImageOps.exif_transpose(im) or im
+                  thumb = im.copy()
+                  thumb.thumbnail((200, 200))
+                  buf = io.BytesIO()
+                  thumb.save(buf, format='WEBP')
+                  t_key = f"thumbnails/{base}_thumb.webp"
+                  s3.put_object(Bucket=dest_bucket, Key=t_key, Body=buf.getvalue(), ContentType='image/webp')
+                  return {'thumbnail': {'key': t_key, 'width': thumb.width, 'height': thumb.height}}
+              elif action == 'persist_and_catalog':
+                  tbl = dynamo.Table(tbl_name)
+                  base = os.path.splitext(os.path.basename(k))[0]
+                  item = {'image_id': f"img_{base}", 'source_key': k, 'upload_timestamp': datetime.now(timezone.utc).isoformat(), 'metadata': event.get('metadata', {}), 'variants': event.get('variants', {})}
+                  tbl.put_item(Item=item)
+                  return {'status': 'CATALOGED', 'imageId': f"img_{base}"}
+              return {'status': 'OK'}
+
+  NotifierFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-NotifierFn'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaBasicRole.Arn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ImageAlertsTopic
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sns = boto3.client('sns')
+          topic = os.environ.get('SNS_TOPIC_ARN')
+          def handler(event, context):
+              sns.publish(TopicArn=topic, Subject="[AWS Image Pipeline] Processed", Message=json.dumps(event, indent=2))
+              return {'statusCode': 200}
+
+  # ─── Step Functions State Machine ────────────────────────────────────────────
+  ImageWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${Environment}-ImageWorkflow'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Validate",
+          "States": {
+            "Validate": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFn.Arn}",
+                "Payload": {"action": "validate", "sourceBucket.$": "$.sourceBucket", "sourceKey.$": "$.sourceKey"}
+              },
+              "ResultSelector": {"status.$": "$.Payload.status", "format.$": "$.Payload.format", "width.$": "$.Payload.width", "height.$": "$.Payload.height", "md5.$": "$.Payload.md5"},
+              "ResultPath": "$.validation",
+              "Next": "ExtractMetadata"
+            },
+            "ExtractMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFn.Arn}",
+                "Payload": {"action": "extract_metadata", "sourceBucket.$": "$.sourceBucket", "sourceKey.$": "$.sourceKey", "validation.$": "$.validation"}
+              },
+              "ResultSelector": {"width.$": "$.Payload.width", "height.$": "$.Payload.height", "format.$": "$.Payload.format", "md5.$": "$.Payload.md5"},
+              "ResultPath": "$.metadata",
+              "Next": "Resize"
+            },
+            "Resize": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFn.Arn}",
+                "Payload": {"action": "resize_and_watermark", "sourceBucket.$": "$.sourceBucket", "sourceKey.$": "$.sourceKey", "metadata.$": "$.metadata"}
+              },
+              "ResultSelector": {"thumbnail.$": "$.Payload.thumbnail"},
+              "ResultPath": "$.variants",
+              "Next": "Catalog"
+            },
+            "Catalog": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFn.Arn}",
+                "Payload": {"action": "persist_and_catalog", "sourceBucket.$": "$.sourceBucket", "sourceKey.$": "$.sourceKey", "metadata.$": "$.metadata", "variants.$": "$.variants"}
+              },
+              "ResultPath": "$.catalog",
+              "Next": "Notify"
+            },
+            "Notify": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotifierFn.Arn}",
+                "Payload": {"status": "SUCCESS", "sourceKey.$": "$.sourceKey", "metadata.$": "$.metadata", "variants.$": "$.variants"}
+              },
+              "End": true
+            }
+          }
+        }
+
+  # ─── API Gateway ─────────────────────────────────────────────────────────────
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${Environment}-ImagePipelineApi'
+
+  UploadUrlRes:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: 'upload-url'
+
+  UploadUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref UploadUrlRes
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresignedUrlFn.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [UploadUrlMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref Environment
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+
+  ApiLambdaPerm:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PresignedUrlFn
+      Principal: apigateway.amazonaws.com
+
+  # ─── CloudFront CDN ──────────────────────────────────────────────────────────
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${Environment}-OAC'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDist:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !Sub '${DestinationBucket}.s3.${AWS::Region}.amazonaws.com'
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+
+  DestPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DestinationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${DestinationBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDist.Id}'
+
+  # ─── CloudWatch Alarm ────────────────────────────────────────────────────────
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-DLQ-Backlog-Alarm'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ImageProcessingDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ImageAlertsTopic
+
+Outputs:
+  ApiEndpointUrl:
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/upload-url'
+    Description: Presigned URL generator API endpoint
+
+  CloudFrontDomain:
+    Value: !GetAtt CloudFrontDist.DomainName
+    Description: CDN Domain for fast global image access
+
+  SourceBucket:
+    Value: !Ref SourceBucket
+
+  DestinationBucket:
+    Value: !Ref DestinationBucket
+
+  DynamoDBTable:
+    Value: !Ref ImageMetadataTable

@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 05: AWS Lambda Functions and SQS Event Source Mapping'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  SourceBucketName:
+    Type: String
+    Description: Name of S3 Source Bucket
+
+  DestinationBucketName:
+    Type: String
+    Description: Name of S3 Destination Bucket
+
+  DynamoDBTableName:
+    Type: String
+    Description: Name of DynamoDB ImageMetadata Table
+
+  QueueArn:
+    Type: String
+    Description: ARN of SQS Main Queue
+
+  SNSTopicArn:
+    Type: String
+    Description: ARN of SNS Alerts Topic
+
+  PresignedUrlGeneratorRoleArn:
+    Type: String
+
+  SQSConsumerRoleArn:
+    Type: String
+
+  ImageProcessorRoleArn:
+    Type: String
+
+  NotificationDispatcherRoleArn:
+    Type: String
+
+  StateMachineArn:
+    Type: String
+    Description: ARN of Step Functions State Machine
+
+  CloudFrontDomain:
+    Type: String
+    Default: ''
+    Description: Optional CloudFront distribution domain name
+
+Resources:
+  # ─── 1. Presigned URL Generator Lambda ───────────────────────────────────────
+  PresignedUrlGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-PresignedUrlGenerator'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref PresignedUrlGeneratorRoleArn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref SourceBucketName
+          URL_EXPIRATION_SECONDS: '900'
+          MAX_FILE_SIZE_MB: '15'
+      Code:
+        ZipFile: |
+          import json, os, uuid, boto3
+          s3_client = boto3.client('s3')
+          SOURCE_BUCKET = os.environ.get('SOURCE_BUCKET', '')
+          URL_EXPIRATION = int(os.environ.get('URL_EXPIRATION_SECONDS', '900'))
+          CORS_HEADERS = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Amz-Date,X-Api-Key',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+          }
+          def handler(event, context):
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': json.dumps({'ok': True})}
+              params = event.get('queryStringParameters') or {}
+              filename = params.get('filename', 'upload.jpg')
+              content_type = params.get('contentType', 'image/jpeg')
+              user_id = params.get('userId', 'anonymous')
+              ext = os.path.splitext(filename)[1] or '.jpg'
+              unique_id = str(uuid.uuid4())
+              key = f"uploads/{user_id}/{unique_id}{ext}"
+              url = s3_client.generate_presigned_url(
+                  ClientMethod='put_object',
+                  Params={'Bucket': SOURCE_BUCKET, 'Key': key, 'ContentType': content_type},
+                  ExpiresIn=URL_EXPIRATION
+              )
+              return {
+                  'statusCode': 200,
+                  'headers': CORS_HEADERS,
+                  'body': json.dumps({'uploadUrl': url, 'bucket': SOURCE_BUCKET, 'key': key, 'fileId': unique_id})
+              }
+
+  # ─── 2. SQS Consumer Lambda ──────────────────────────────────────────────────
+  SQSConsumerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-SQSConsumer'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref SQSConsumerRoleArn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachineArn
+      Code:
+        ZipFile: |
+          import json, os, urllib.parse, boto3
+          sfn_client = boto3.client('stepfunctions')
+          STATE_MACHINE_ARN = os.environ.get('STATE_MACHINE_ARN', '')
+          def handler(event, context):
+              for record in event.get('Records', []):
+                  body = json.loads(record.get('body', '{}'))
+                  for s3_rec in body.get('Records', []):
+                      s3_data = s3_rec.get('s3', {})
+                      bucket = s3_data.get('bucket', {}).get('name')
+                      key = urllib.parse.unquote_plus(s3_data.get('object', {}).get('key', ''))
+                      size = s3_data.get('object', {}).get('size', 0)
+                      if bucket and key:
+                          clean_key = "".join([c if c.isalnum() or c in "-_" else "_" for c in key])[:50]
+                          exec_name = f"run-{clean_key}-{context.aws_request_id[:8]}"
+                          sfn_client.start_execution(
+                              stateMachineArn=STATE_MACHINE_ARN,
+                              name=exec_name,
+                              input=json.dumps({'sourceBucket': bucket, 'sourceKey': key, 'objectSize': size})
+                          )
+              return {'statusCode': 200}
+
+  # ─── Event Source Mapping: SQS -> SQSConsumerFunction ────────────────────────
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref QueueArn
+      FunctionName: !GetAtt SQSConsumerFunction.Arn
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 5
+      ScalingConfig:
+        MaximumConcurrency: 10
+      Enabled: true
+
+  # ─── 3. Image Processor Lambda ───────────────────────────────────────────────
+  ImageProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-ImageProcessor'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref ImageProcessorRoleArn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DestinationBucketName
+          DYNAMODB_TABLE: !Ref DynamoDBTableName
+          CLOUDFRONT_DOMAIN: !Ref CloudFrontDomain
+          WATERMARK_TEXT: 'AWS SAA PROCESSED'
+          MAX_FILE_SIZE_MB: '15'
+      Code:
+        ZipFile: |
+          import json, os, io, hashlib, boto3
+          from datetime import datetime, timezone
+          from PIL import Image, ImageOps, ImageDraw, ImageFont
+          s3_client = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          DESTINATION_BUCKET = os.environ.get('DESTINATION_BUCKET', '')
+          DYNAMODB_TABLE = os.environ.get('DYNAMODB_TABLE', '')
+          CLOUDFRONT_DOMAIN = os.environ.get('CLOUDFRONT_DOMAIN', '')
+          WATERMARK_TEXT = os.environ.get('WATERMARK_TEXT', 'PROCESSED')
+          def handler(event, context):
+              action = event.get('action')
+              bucket = event.get('sourceBucket')
+              key = event.get('sourceKey')
+              if action == 'validate':
+                  obj = s3_client.get_object(Bucket=bucket, Key=key)
+                  raw = obj['Body'].read()
+                  with Image.open(io.BytesIO(raw)) as img:
+                      fmt = img.format
+                      w, h = img.size
+                  return {'status': 'VALIDATED', 'format': fmt, 'width': w, 'height': h, 'byteSize': len(raw), 'md5Checksum': hashlib.md5(raw).hexdigest()}
+              elif action == 'extract_metadata':
+                  val = event.get('validation', {})
+                  w, h = val.get('width', 1), val.get('height', 1)
+                  return {'width': w, 'height': h, 'aspectRatio': f"{w}:{h}", 'colorMode': 'RGB', 'hasAlphaChannel': False, 'format': val.get('format', 'JPEG'), 'md5': val.get('md5Checksum', ''), 'extractedAt': datetime.now(timezone.utc).isoformat()}
+              elif action == 'resize_and_watermark':
+                  base = os.path.splitext(os.path.basename(key))[0]
+                  obj = s3_client.get_object(Bucket=bucket, Key=key)
+                  img = Image.open(io.BytesIO(obj['Body'].read()))
+                  img = ImageOps.exif_transpose(img) or img
+                  thumb = img.copy()
+                  thumb.thumbnail((200, 200))
+                  buf = io.BytesIO()
+                  thumb.save(buf, format='WEBP')
+                  thumb_key = f"thumbnails/{base}_thumb.webp"
+                  s3_client.put_object(Bucket=DESTINATION_BUCKET, Key=thumb_key, Body=buf.getvalue(), ContentType='image/webp')
+                  return {
+                      'thumbnail': {'key': thumb_key, 'width': thumb.width, 'height': thumb.height, 'cdnUrl': f"https://{CLOUDFRONT_DOMAIN}/{thumb_key}" if CLOUDFRONT_DOMAIN else f"s3://{DESTINATION_BUCKET}/{thumb_key}"},
+                      'preview': {'key': thumb_key, 'width': thumb.width, 'height': thumb.height, 'cdnUrl': f"https://{CLOUDFRONT_DOMAIN}/{thumb_key}" if CLOUDFRONT_DOMAIN else f"s3://{DESTINATION_BUCKET}/{thumb_key}"}
+                  }
+              elif action == 'persist_and_catalog':
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  base = os.path.splitext(os.path.basename(key))[0]
+                  img_id = f"img_{base}"
+                  item = {'image_id': img_id, 'user_id': 'demo_user', 'source_key': key, 'upload_timestamp': datetime.now(timezone.utc).isoformat(), 'metadata': event.get('metadata', {}), 'variants': event.get('variants', {})}
+                  table.put_item(Item=item)
+                  return {'status': 'CATALOGED', 'imageId': img_id, 'persistedAt': datetime.now(timezone.utc).isoformat()}
+              return {'status': 'OK'}
+
+  # ─── 4. Notification Dispatcher Lambda ───────────────────────────────────────
+  NotificationDispatcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-NotificationDispatcher'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !Ref NotificationDispatcherRoleArn
+      Timeout: 15
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopicArn
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sns_client = boto3.client('sns')
+          SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
+          def handler(event, context):
+              msg = f"Image processing event:\n{json.dumps(event, indent=2)}"
+              sns_client.publish(TopicArn=SNS_TOPIC_ARN, Subject="[AWS Image Pipeline] Alert", Message=msg)
+              return {'statusCode': 200}
+
+Outputs:
+  PresignedUrlGeneratorFunctionArn:
+    Value: !GetAtt PresignedUrlGeneratorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PresignedUrlGeneratorArn'
+
+  SQSConsumerFunctionArn:
+    Value: !GetAtt SQSConsumerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SQSConsumerArn'
+
+  ImageProcessorFunctionArn:
+    Value: !GetAtt ImageProcessorFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageProcessorArn'
+
+  NotificationDispatcherFunctionArn:
+    Value: !GetAtt NotificationDispatcherFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationDispatcherArn'

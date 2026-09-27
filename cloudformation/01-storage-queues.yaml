@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 01: S3 Buckets, SQS Queues, DLQ, and Event Notifications'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment stage name
+
+  ProjectName:
+    Type: String
+    Default: ServerlessImagePipeline
+    Description: Project tag name
+
+Resources:
+  # ─── S3 Access Logs Bucket ───────────────────────────────────────────────────
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${Environment}-image-pipeline-logs'
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── S3 Source Bucket (Raw Uploads) ──────────────────────────────────────────
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${Environment}-raw-images-source'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionRawToGlacierAfter90Days
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+          - Id: ExpireRawAfter365Days
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── S3 Destination Bucket (Processed Thumbnails & Previews) ─────────────────
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::Region}-${Environment}-processed-images-dest'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── S3 Enforce TLS Policy on Source Bucket ──────────────────────────────────
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceTlsRequestsOnly
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${SourceBucket.Arn}'
+              - !Sub '${SourceBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ─── Amazon SQS Dead-Letter Queue (DLQ) ──────────────────────────────────────
+  ImageProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-image-processing-dlq'
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId: 'alias/aws/sqs'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Amazon SQS Main Queue ───────────────────────────────────────────────────
+  ImageProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-image-processing-queue'
+      VisibilityTimeout: 300 # 5 minutes (exceeds Lambda processing timeout)
+      MessageRetentionPeriod: 345600 # 4 days
+      KmsMasterKeyId: 'alias/aws/sqs'
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ImageProcessingDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Queue Policy Allowing S3 Bucket to Publish Notifications ────────────────
+  ImageProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ImageProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3BucketNotifications
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - 'sqs:SendMessage'
+            Resource: !GetAtt ImageProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt SourceBucket.Arn
+
+Outputs:
+  SourceBucketName:
+    Value: !Ref SourceBucket
+    Description: Name of S3 Source Bucket for raw uploads
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketName'
+
+  SourceBucketArn:
+    Value: !GetAtt SourceBucket.Arn
+    Description: ARN of S3 Source Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-SourceBucketArn'
+
+  DestinationBucketName:
+    Value: !Ref DestinationBucket
+    Description: Name of S3 Destination Bucket for processed assets
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketName'
+
+  DestinationBucketArn:
+    Value: !GetAtt DestinationBucket.Arn
+    Description: ARN of S3 Destination Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DestinationBucketArn'
+
+  ImageProcessingQueueUrl:
+    Value: !Ref ImageProcessingQueue
+    Description: URL of SQS Main Queue
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueUrl'
+
+  ImageProcessingQueueArn:
+    Value: !GetAtt ImageProcessingQueue.Arn
+    Description: ARN of SQS Main Queue
+    Export:
+      Name: !Sub '${AWS::StackName}-QueueArn'
+
+  ImageProcessingDLQArn:
+    Value: !GetAtt ImageProcessingDLQ.Arn
+    Description: ARN of SQS Dead-Letter Queue
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQArn'

@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 04: AWS Step Functions Image Processing State Machine'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  StepFunctionsExecutionRoleArn:
+    Type: String
+    Description: ARN of IAM Role for Step Functions
+
+  ImageProcessorFunctionArn:
+    Type: String
+    Description: ARN of Image Processor Lambda Function
+
+  NotificationDispatcherFunctionArn:
+    Type: String
+    Description: ARN of Notification Dispatcher Lambda Function
+
+Resources:
+  ImageProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${Environment}-ImageProcessingWorkflow'
+      RoleArn: !Ref StepFunctionsExecutionRoleArn
+      StateMachineType: STANDARD
+      DefinitionString: !Sub |
+        {
+          "Comment": "AWS Step Functions Workflow for Serverless Image Processing Pipeline",
+          "StartAt": "ValidateImage",
+          "States": {
+            "ValidateImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFunctionArn}",
+                "Payload": {
+                  "action": "validate",
+                  "sourceBucket.$": "$.sourceBucket",
+                  "sourceKey.$": "$.sourceKey",
+                  "objectSize.$": "$.objectSize",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultSelector": {
+                "status.$": "$.Payload.status",
+                "format.$": "$.Payload.format",
+                "width.$": "$.Payload.width",
+                "height.$": "$.Payload.height",
+                "byteSize.$": "$.Payload.byteSize",
+                "md5Checksum.$": "$.Payload.md5Checksum"
+              },
+              "ResultPath": "$.validation",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "HandleFailure"
+                }
+              ],
+              "Next": "ExtractMetadata"
+            },
+            "ExtractMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFunctionArn}",
+                "Payload": {
+                  "action": "extract_metadata",
+                  "sourceBucket.$": "$.sourceBucket",
+                  "sourceKey.$": "$.sourceKey",
+                  "validation.$": "$.validation",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultSelector": {
+                "width.$": "$.Payload.width",
+                "height.$": "$.Payload.height",
+                "aspectRatio.$": "$.Payload.aspectRatio",
+                "colorMode.$": "$.Payload.colorMode",
+                "hasAlphaChannel.$": "$.Payload.hasAlphaChannel",
+                "format.$": "$.Payload.format",
+                "md5.$": "$.Payload.md5",
+                "extractedAt.$": "$.Payload.extractedAt"
+              },
+              "ResultPath": "$.metadata",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "HandleFailure"
+                }
+              ],
+              "Next": "ResizeAndWatermark"
+            },
+            "ResizeAndWatermark": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFunctionArn}",
+                "Payload": {
+                  "action": "resize_and_watermark",
+                  "sourceBucket.$": "$.sourceBucket",
+                  "sourceKey.$": "$.sourceKey",
+                  "metadata.$": "$.metadata",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultSelector": {
+                "thumbnail.$": "$.Payload.thumbnail",
+                "preview.$": "$.Payload.preview"
+              },
+              "ResultPath": "$.variants",
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "HandleFailure"
+                }
+              ],
+              "Next": "PersistAndCatalog"
+            },
+            "PersistAndCatalog": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ImageProcessorFunctionArn}",
+                "Payload": {
+                  "action": "persist_and_catalog",
+                  "sourceBucket.$": "$.sourceBucket",
+                  "sourceKey.$": "$.sourceKey",
+                  "metadata.$": "$.metadata",
+                  "variants.$": "$.variants",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultSelector": {
+                "status.$": "$.Payload.status",
+                "imageId.$": "$.Payload.imageId",
+                "persistedAt.$": "$.Payload.persistedAt"
+              },
+              "ResultPath": "$.catalog",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "DynamoDb.ProvisionedThroughputExceededException",
+                    "Lambda.ServiceException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "HandleFailure"
+                }
+              ],
+              "Next": "PublishNotification"
+            },
+            "PublishNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationDispatcherFunctionArn}",
+                "Payload": {
+                  "status": "COMPLETED",
+                  "sourceKey.$": "$.sourceKey",
+                  "metadata.$": "$.metadata",
+                  "variants.$": "$.variants",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultPath": "$.notification",
+              "Next": "ProcessingSuccess"
+            },
+            "ProcessingSuccess": {
+              "Type": "Succeed"
+            },
+            "HandleFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificationDispatcherFunctionArn}",
+                "Payload": {
+                  "status": "FAILED",
+                  "sourceKey.$": "$.sourceKey",
+                  "errorInfo.$": "$.errorInfo",
+                  "executionId.$": "$$.Execution.Id"
+                }
+              },
+              "ResultPath": "$.failureNotification",
+              "Next": "ProcessingFailed"
+            },
+            "ProcessingFailed": {
+              "Type": "Fail",
+              "Cause": "Image processing workflow failed during execution.",
+              "Error": "PipelineExecutionError"
+            }
+          }
+        }
+      TracingConfiguration:
+        Enabled: true
+
+Outputs:
+  StateMachineArn:
+    Value: !Ref ImageProcessingStateMachine
+    Description: ARN of the Step Functions State Machine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  StateMachineName:
+    Value: !GetAtt ImageProcessingStateMachine.Name
+    Description: Name of the Step Functions State Machine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineName'

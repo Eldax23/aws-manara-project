@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 02: DynamoDB Metadata Catalog and SNS Alerts Topic'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment stage name
+
+  ProjectName:
+    Type: String
+    Default: ServerlessImagePipeline
+    Description: Project tag name
+
+  NotificationEmail:
+    Type: String
+    Description: Operator email address to receive notifications and alarms
+
+Resources:
+  # ─── Amazon DynamoDB Image Metadata Table ────────────────────────────────────
+  ImageMetadataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${Environment}-ImageMetadata'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: upload_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: image_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: upload_timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Amazon SNS Notification Topic ───────────────────────────────────────────
+  ImageProcessingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Environment}-image-processing-alerts'
+      DisplayName: 'Image Processing Pipeline Alerts'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── SNS Email Subscription ──────────────────────────────────────────────────
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ImageProcessingAlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+Outputs:
+  DynamoDBTableName:
+    Value: !Ref ImageMetadataTable
+    Description: Name of DynamoDB ImageMetadata Table
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableName'
+
+  DynamoDBTableArn:
+    Value: !GetAtt ImageMetadataTable.Arn
+    Description: ARN of DynamoDB ImageMetadata Table
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTableArn'
+
+  SNSTopicArn:
+    Value: !Ref ImageProcessingAlertsTopic
+    Description: ARN of SNS Pipeline Alerts Topic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'

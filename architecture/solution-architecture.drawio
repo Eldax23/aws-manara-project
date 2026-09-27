@@ -1,0 +1,135 @@
+<mxfile host="Electron" modified="2026-09-27T08:00:00.000Z" agent="Antigravity" version="21.6.8" type="device">
+  <diagram id="serverless-image-pipeline" name="Solution Architecture">
+    <mxGraphModel dx="1422" dy="845" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="1000" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        
+        <mxCell id="grp_ingest" value="1. INGESTION &amp; UPLOAD TIER" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;dashed=1;dashPattern=5 5;fillColor=#161b22;strokeColor=#58a6ff;fontColor=#58a6ff;fontStyle=1;fontSize=14;opacity=90;" vertex="1" parent="1">
+          <mxGeometry x="60" y="80" width="340" height="480" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="grp_queue" value="2. DECOUPLING TIER" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;dashed=1;dashPattern=5 5;fillColor=#161b22;strokeColor=#ff9900;fontColor=#ff9900;fontStyle=1;fontSize=14;opacity=90;" vertex="1" parent="1">
+          <mxGeometry x="440" y="80" width="280" height="480" as="geometry" />
+        </mxCell>
+
+        <mxCell id="grp_sfn" value="3. STEP FUNCTIONS ORCHESTRATION" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;dashed=1;dashPattern=5 5;fillColor=#161b22;strokeColor=#bc8cff;fontColor=#bc8cff;fontStyle=1;fontSize=14;opacity=90;" vertex="1" parent="1">
+          <mxGeometry x="760" y="80" width="360" height="740" as="geometry" />
+        </mxCell>
+
+        <mxCell id="grp_dest" value="4. PERSISTENCE &amp; DELIVERY" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;dashed=1;dashPattern=5 5;fillColor=#161b22;strokeColor=#3fb950;fontColor=#3fb950;fontStyle=1;fontSize=14;opacity=90;" vertex="1" parent="1">
+          <mxGeometry x="1160" y="80" width="340" height="740" as="geometry" />
+        </mxCell>
+
+        <mxCell id="grp_ops" value="5. OBSERVABILITY &amp; DLQ ALERTS" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;dashed=1;dashPattern=5 5;fillColor=#161b22;strokeColor=#f85149;fontColor=#f85149;fontStyle=1;fontSize=14;opacity=90;" vertex="1" parent="1">
+          <mxGeometry x="60" y="600" width="660" height="220" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_client" value="Web / Mobile Client&#xa;(Direct Upload)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#58a6ff;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="140" width="130" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_apigw" value="Amazon API Gateway&#xa;GET /upload-url" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#58a6ff;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="140" width="130" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_lambda_url" value="AWS Lambda&#xa;Presigned URL Signer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#ff9900;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="250" y="270" width="130" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_s3_raw" value="S3 Source Bucket&#xa;(Raw Images)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#3fb950;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="270" width="130" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_sqs" value="Amazon SQS&#xa;Image Processing Queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#ff9900;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="480" y="140" width="200" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_dlq" value="Amazon SQS DLQ&#xa;Dead Letter Queue" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#f85149;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="480" y="270" width="200" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="sfn_val" value="1. Validate Image&#xa;(MIME &amp; Size)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#bc8cff;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="800" y="150" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn_meta" value="2. Extract Metadata&#xa;(Dimensions &amp; EXIF)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#bc8cff;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="800" y="260" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn_thumb" value="3. Generate Thumbnail&#xa;(Pillow 200x200)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#bc8cff;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="800" y="370" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn_wm" value="4. Apply Watermark&#xa;(Overlay &amp; Opacity)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#bc8cff;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="800" y="480" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sfn_store" value="5. Persist &amp; Notify&#xa;(S3 + DynamoDB + SNS)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#bc8cff;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="800" y="590" width="280" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_s3_dest" value="S3 Destination Bucket&#xa;(Thumbnails &amp; Watermarked)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#3fb950;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="150" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_cf" value="Amazon CloudFront&#xa;Global CDN Distribution" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#58a6ff;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="310" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_ddb" value="Amazon DynamoDB&#xa;ImageMetadata Table" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#ff9900;fontColor=#ffffff;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="1210" y="470" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="node_cw" value="CloudWatch Alarms&#xa;(DLQ Depth &amp; Lambda Errors)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#f85149;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="100" y="660" width="220" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="node_sns" value="Amazon SNS Topic&#xa;(Operator Email Alerts)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#21262d;strokeColor=#f85149;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="380" y="660" width="220" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="e1" value="1. Request URL" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#58a6ff;fontColor=#58a6ff;" edge="1" parent="1" source="node_client" target="node_apigw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="2. Generate Token" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#58a6ff;fontColor=#58a6ff;" edge="1" parent="1" source="node_apigw" target="node_lambda_url">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="3. PUT S3 Direct" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#3fb950;fontColor=#3fb950;" edge="1" parent="1" source="node_client" target="node_s3_raw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="4. s3:ObjectCreated" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ff9900;fontColor=#ff9900;" edge="1" parent="1" source="node_s3_raw" target="node_sqs">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="5. Start Execution" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#bc8cff;fontColor=#bc8cff;" edge="1" parent="1" source="node_sqs" target="sfn_val">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sfn1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#bc8cff;" edge="1" parent="1" source="sfn_val" target="sfn_meta">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sfn2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#bc8cff;" edge="1" parent="1" source="sfn_meta" target="sfn_thumb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sfn3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#bc8cff;" edge="1" parent="1" source="sfn_thumb" target="sfn_wm">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_sfn4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#bc8cff;" edge="1" parent="1" source="sfn_wm" target="sfn_store">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="6. Store Images" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#3fb950;fontColor=#3fb950;" edge="1" parent="1" source="sfn_store" target="node_s3_dest">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="7. Save Record" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#ff9900;fontColor=#ff9900;" edge="1" parent="1" source="sfn_store" target="node_ddb">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="8. Edge Cache" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#58a6ff;fontColor=#58a6ff;" edge="1" parent="1" source="node_s3_dest" target="node_cf">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" value="Failures &gt; 3 retries" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#f85149;fontColor=#f85149;" edge="1" parent="1" source="node_sqs" target="node_dlq">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#f85149;" edge="1" parent="1" source="node_dlq" target="node_cw">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e11" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#f85149;" edge="1" parent="1" source="node_cw" target="node_sns">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

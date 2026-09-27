@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Module 08: Amazon CloudWatch Alarms and Operational Dashboard'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  DLQName:
+    Type: String
+    Description: Name of SQS Dead-Letter Queue
+
+  SNSTopicArn:
+    Type: String
+    Description: ARN of SNS Alerts Topic
+
+  ImageProcessorFunctionName:
+    Type: String
+    Description: Name of Image Processor Lambda function
+
+  StateMachineArn:
+    Type: String
+    Description: ARN of Step Functions State Machine
+
+Resources:
+  # ─── 1. DLQ Messages Backlog Alarm ───────────────────────────────────────────
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-DLQ-Messages-Alarm'
+      AlarmDescription: 'Triggers when poison or failed messages appear in the Dead-Letter Queue'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !Ref DLQName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SNSTopicArn
+      OKActions:
+        - !Ref SNSTopicArn
+
+  # ─── 2. Lambda Error Rate Alarm ──────────────────────────────────────────────
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-ImageProcessor-Errors-Alarm'
+      AlarmDescription: 'Triggers when image processing lambda errors occur'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ImageProcessorFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+  # ─── 3. Step Functions Execution Failures Alarm ──────────────────────────────
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-StepFunctions-FailedExecutions-Alarm'
+      AlarmDescription: 'Triggers when Step Functions image workflow executions fail'
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref StateMachineArn
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SNSTopicArn
+
+  # ─── 4. CloudWatch Operational Dashboard ─────────────────────────────────────
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${Environment}-ImagePipeline-Operations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Lambda Invocations & Errors",
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ImageProcessorFunctionName}", { "stat": "Sum" } ],
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${ImageProcessorFunctionName}", { "stat": "Sum", "color": "#d62728" } ]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "SQS Queue Depth vs DLQ Backlog",
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${Environment}-image-processing-queue", { "stat": "Average" } ],
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${DLQName}", { "stat": "Average", "color": "#d62728" } ]
+                ],
+                "period": 60,
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 24,
+              "height": 6,
+              "properties": {
+                "title": "Step Functions Execution Status",
+                "metrics": [
+                  [ "AWS/States", "ExecutionsSucceeded", "StateMachineArn", "${StateMachineArn}", { "stat": "Sum", "color": "#2ca02c" } ],
+                  [ "AWS/States", "ExecutionsFailed", "StateMachineArn", "${StateMachineArn}", { "stat": "Sum", "color": "#d62728" } ],
+                  [ "AWS/States", "ExecutionsTimedOut", "StateMachineArn", "${StateMachineArn}", { "stat": "Sum", "color": "#ff7f0e" } ]
+                ],
+                "period": 300,
+                "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardName:
+    Value: !Ref PipelineDashboard
+    Description: Name of the CloudWatch Operations Dashboard
